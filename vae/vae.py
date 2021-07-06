@@ -51,9 +51,10 @@ def plot_grad_flow(named_parameters):
 # vae has an encoder: image -> cnn -> \mu, \sigma, -> decoder -> image
 class vae_encoder(nn.Module):
 
-    def __init__(self, latent_dim=2):
+    def __init__(self, latent_dim=2, do_train=True):
         super(vae_encoder, self).__init__()
         self.latent_dim = latent_dim
+        self.do_train = do_train
         self.conv11 = nn.Conv2d(in_channels=1, out_channels=8, kernel_size=(3, 3), padding=1)
         self.conv12 = nn.Conv2d(in_channels=8, out_channels=8, kernel_size=(3, 3), padding=1)
 
@@ -85,14 +86,15 @@ class vae_encoder(nn.Module):
         x = x.view(x.size(0), -1) # flatten batch of multi-channel feature maps to a batch of feature vectors
         mu = self.mu(x)
         log_sigma = self.log_sigma(x)
-        # mu = x
-        # log_sigma = x
-        std_normal = torch.distributions.MultivariateNormal(loc=torch.zeros(size=(mu.shape[1],)),
-                                                            covariance_matrix=torch.diag(torch.ones((mu.shape[1],))))
-        epsilons = std_normal.sample(sample_shape=(mu.shape[0],))
-        # z_i = u_i + exp(log_sigma_i)*epsilons
-        # epsilons = 0
-        z = mu + torch.exp(log_sigma)*epsilons
+        if self.do_train:
+            std_normal = torch.distributions.MultivariateNormal(loc=torch.zeros(size=(mu.shape[1],)),
+                                                                covariance_matrix=torch.diag(torch.ones((mu.shape[1],))))
+            epsilons = std_normal.sample(sample_shape=(mu.shape[0],))
+            # z_i = u_i + exp(log_sigma_i)*epsilons
+            # epsilons = 0
+            z = mu + torch.exp(log_sigma)*epsilons
+        else:
+            z = mu
         return mu, log_sigma, z
 
 class vae_decoder(nn.Module):
@@ -139,10 +141,12 @@ class vae_decoder(nn.Module):
         return x
 
 class vae(nn.Module):
-    def __init__(self, latent_dim=256):
+    def __init__(self, latent_dim=256, do_train=True):
         super(vae, self).__init__()
         self.latent_dim = latent_dim
-        self.encoder = vae_encoder(latent_dim=self.latent_dim)
+        self.do_train = do_train
+
+        self.encoder = vae_encoder(latent_dim=self.latent_dim, do_train=do_train)
         self.decoder = vae_decoder(latent_dim=self.latent_dim)
 
     def forward(self, x):
@@ -196,14 +200,44 @@ def L_logqz_x(z, mu, log_sigma):
     return avg_logqz_x
 
 
+def kl_loss(mu, log_sigma):
+    # = E_q[ \log ( q(z|x) / p(z)) ]
+    # q(z | x) = N(mu, exp(log_sigma)^2)
+    # p(z) = N(0, I)
+    # log q(z | x) = log( 1/[(2pi)^D/2 det(Sigma)^1/2] - 0.5 (z - mu) T Sigma^-1 (z - mu)
+    #              = log(1/((2pi)^D/2)) - 0.5 log(det(Sigma) - 0.5 \sigma* eps'Sigma^-1 \sigma*eps
+    #              = c - 0.5 log(\prod \sigma_i ^2) - 0.5 \sum_i \eps_i ^2
+    #              = c - \sum_i (log \sigma_i) - 0.5 \sum_i \eps_i^2
+    #
+    # log p (z) = log(1/(2pi)^D/2) - 0.5zTz
+    # log p(z) = c - 0.5 \sum z_i ^ 2
+    # E_eps[log q(z|x) - log p(z)]
+    # E_eps[- \sum_i (log \sigma_i) - 0.5 \sum_i eps_i^2 + 0.5 \sum z_i^2]
+    # \sum_i[ - log \sigma_i] - 0.5 E[\sum_i eps_i^2] + 0.5 E[(\mu + \sigma*\eps)^2]
+    # \sum_i[ - log \sigma_i] - 0.5 * \sum_i 1 + 0.5 (\sum_i \mu_i^2) + E[\sum_i 2*mu_i*eps_i] + \sum_i \sigma_i^2
+    # \sum_i[ - log \sigma_i] + 0.5 \sum_i [ - 1 +  mu_i^2 + \sigma_i^2]
+    
+    loss = -torch.sum(log_sigma, dim=1) + 0.5 * torch.sum(-1 + mu*mu + torch.exp(log_sigma)*torch.exp(log_sigma), dim=1)
+    avg_batch_loss = torch.mean(loss)
+    return avg_batch_loss
 
+def vae_loss_closed_form(x, mu, log_sigma, z, xhat):
+    kl = kl_loss(mu, log_sigma)
+    recon_loss = - L_logpx_z(x=x, xhat=xhat)
+    loss = recon_loss + kl
+    return loss, kl
 
 def vae_loss(x, mu, log_sigma, z, xhat):
-    # ELBO = E_q[ \log p(x | z) + \log p(z) - \log q(z | x)]
-    recon_loss = - L_logpx_z(x, xhat)
-    # loss = - (L_logpx_z(x, xhat) + L_logpz(z) - L_logqz_x(z, mu, log_sigma))
-    vae_loss = recon_loss
-    return vae_loss
+    # argmax ELBO = E_q[ \log p(x | z) + \log p(z) - \log q(z | x)]
+    #      = E_q[\log p( x | z)] + E_q[\log p(z) - \log q(z | x)]
+    #      = L_logpx_z() + E_q[\log ( p(z) / q(z|x) )]
+    #      = L_logpx_z() - E_q[\log (q(z|x) / p(z)) ]
+    #      = L_logpx_z() - KL(q(z|x) || p(z))
+    #      = argmin KL(q(z|x) || p(z)) - L_logpx_z()
+    #      = argmin KL(q(z|x) || p(z)) + ReconLoss
+
+    loss = - (L_logpx_z(x, xhat) + L_logpz(z) - L_logqz_x(z, mu, log_sigma))
+    return loss
 
 def train_model(config, model, dataloaders, dataset_sizes, num_epochs, optimizer, scheduler, device):
     since = time.time()
@@ -224,7 +258,7 @@ def train_model(config, model, dataloaders, dataset_sizes, num_epochs, optimizer
             running_recon_loss = 0.0
 
             # iterate over data
-            for samples in dataloaders[phase]:
+            for samples in tqdm(dataloaders[phase]):
                 imgs = samples[0]
                 imgs = imgs.to(device)
 
@@ -234,10 +268,13 @@ def train_model(config, model, dataloaders, dataset_sizes, num_epochs, optimizer
                 # forward pass
                 with torch.set_grad_enabled(phase == 'train'):
                     mu, log_sigma, z, imgs_hat = model(imgs)
-                    vloss = vae_loss(imgs, mu, log_sigma, z, imgs_hat)
+                    vloss, kl = vae_loss_closed_form(imgs, mu, log_sigma, z, imgs_hat)
                     if phase == 'train':
                         vloss.backward()
                         optimizer.step()
+                        # print(vloss.item())
+                        # print(kl.item())
+                        
                         # for n, p in model.named_parameters():
                             # if n == 'encoder.conv11.weight':
                             #     print(vloss.item())
@@ -245,11 +282,10 @@ def train_model(config, model, dataloaders, dataset_sizes, num_epochs, optimizer
 
                 # stats
                 running_loss = running_loss + vloss.item()*imgs.size()[0]
-                # running_recon_loss = running_recon_loss + recon_loss.item()*imgs.size()[0]
-
-
+                running_recon_loss = running_recon_loss + kl.item()*imgs.size()[0]
+            
             epoch_loss = running_loss / dataset_sizes[phase]
-            epoch_recon_loss = 0 #running_recon_loss / dataset_sizes[phase]
+            epoch_recon_loss = running_recon_loss / dataset_sizes[phase]
 
             if phase == 'train':
                 scheduler.step()
@@ -280,14 +316,16 @@ def visualize_batch(batch):
 
     plt.show()
 
+
+
 if __name__ == "__main__":
     # load mnist datasets
-    train_data = datasets.MNIST(root='./data/',
+    train_data = datasets.MNIST(root='../data/',
                                 train=True,
                                 download=False,
                                 transform=torchvision.transforms.Compose([Resize(size=(32, 32)), ToTensor()])
                                 )
-    test_data = datasets.MNIST(root='./data/',
+    test_data = datasets.MNIST(root='../data/',
                                train=False,
                                download=False,
                                transform=torchvision.transforms.Compose([Resize(size=(32, 32)), ToTensor()])
