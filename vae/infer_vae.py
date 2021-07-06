@@ -72,4 +72,30 @@ if __name__=="__main__":
     plt.show()
 
     # sne of features with their labels
+    from sklearn.manifold import TSNE
+    tsne = TSNE(n_components=2, perplexity=50)
+    test_embedding = tsne.fit_transform(test_mu)
+
+    plt.figure()
+    plt.scatter(x=test_embedding[:,0], y=test_embedding[:,1], c=test_labels, marker='o', cmap='tab10')
+    plt.colorbar()
+    plt.show()
+
+    # traverse from 0 to 1
+    feat_0 = test_mu[np.argwhere(test_labels==0), :]
+    feat_1 = test_mu[np.argwhere(test_labels==1), :]
+    mu_feat0 = np.mean(feat_0, axis=0)
+    mu_feat1 = np.mean(feat_1, axis=0)
+    diff_01 = mu_feat1 - mu_feat0
+    steps = 10
+    delta = diff_01/10
+    fig, ax = plt.subplots(1, 10)
+    for i in range(10):
+        feat = mu_feat0 + i*delta
+        # apply decoder
+        feat = torch.from_numpy(feat)
+        feat = feat.to(device)
+        fhat = mnist_vae.decoder(feat)
+        ax[i].imshow(fhat.detach().numpy()[0,0,:,:])
+
 
